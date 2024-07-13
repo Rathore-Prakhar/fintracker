@@ -3,37 +3,55 @@ import yfinance as yf
 import pandas as pd
 import matplotlib.pyplot as plt
 import json
+import sqlite3
 
 class Portfolio:
-    def __init__(self):
-        self.holdings = {}
+    def __init__(self, db_file='portfolio.db'):
+        self.db_file = db_file
+        self.conn = sqlite3.connect(self.db_file)
+        self.create_table()
+
+    def create_table(self):
+        with self.conn:
+            self.conn.execute('''
+                CREATE TABLE IF NOT EXISTS holdings (
+                    ticker TEXT PRIMARY KEY,
+                    shares REAL
+                )
+            ''')
 
     def add_position(self, ticker, shares):
-        if ticker in self.holdings:
-            self.holdings[ticker] += shares
-        else:
-            self.holdings[ticker] = shares
+        with self.conn:
+            self.conn.execute('''
+                INSERT INTO holdings (ticker, shares)
+                VALUES (?, ?)
+                ON CONFLICT(ticker) DO UPDATE SET shares = shares + excluded.shares
+            ''', (ticker, shares))
 
     def remove_position(self, ticker, shares):
-        if ticker in self.holdings:
-            self.holdings[ticker] -= shares
-            if self.holdings[ticker] <= 0:
-                del self.holdings[ticker]
+        with self.conn:
+            self.conn.execute('''
+                UPDATE holdings SET shares = shares - ?
+                WHERE ticker = ?
+            ''', (shares, ticker))
+            self.conn.execute('''
+                DELETE FROM holdings WHERE shares <= 0
+            ''')
 
     def get_current_value(self):
         total_value = 0
-        for ticker, shares in self.holdings.items():
+        for ticker, shares in self.get_holdings().items():
             stock = yf.Ticker(ticker)
-            current_price = stock.info['regularMarketPrice']
+            current_price = stock.info['currentPrice']
             total_value += current_price * shares
         return total_value
 
     def plot_portfolio_composition(self):
         values = []
         labels = []
-        for ticker, shares in self.holdings.items():
+        for ticker, shares in self.get_holdings().items():
             stock = yf.Ticker(ticker)
-            current_price = stock.info['regularMarketPrice']
+            current_price = stock.info['currentPrice']
             value = current_price * shares
             values.append(value)
             labels.append(ticker)
@@ -44,13 +62,22 @@ class Portfolio:
         plt.savefig('portfolio_composition.png')
         plt.close()
 
+    def get_holdings(self):
+        cursor = self.conn.execute('SELECT ticker, shares FROM holdings')
+        return {row[0]: row[1] for row in cursor}
+
     def save_portfolio(self, filename):
+        holdings = self.get_holdings()
         with open(filename, 'w') as f:
-            json.dump(self.holdings, f)
+            json.dump(holdings, f)
 
     def load_portfolio(self, filename):
         with open(filename, 'r') as f:
-            self.holdings = json.load(f)
+            holdings = json.load(f)
+        with self.conn:
+            self.conn.execute('DELETE FROM holdings')
+            for ticker, shares in holdings.items():
+                self.add_position(ticker, shares)
 
 def main():
     parser = argparse.ArgumentParser(description="Portfolio Tracker CLI")
@@ -58,10 +85,11 @@ def main():
     parser.add_argument('--ticker', help="Stock ticker symbol")
     parser.add_argument('--shares', type=float, help="Number of shares")
     parser.add_argument('--file', help="Filename for save/load")
+    parser.add_argument('--db', default='portfolio.db', help="Database file")
 
     args = parser.parse_args()
 
-    portfolio = Portfolio()
+    portfolio = Portfolio(args.db)
 
     if args.action == 'add':
         portfolio.add_position(args.ticker, args.shares)
