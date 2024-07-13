@@ -1,9 +1,8 @@
-import argparse
 import yfinance as yf
-import pandas as pd
 import matplotlib.pyplot as plt
-import json
 import sqlite3
+from InquirerPy import prompt
+from InquirerPy.validator import EmptyInputValidator
 
 class Portfolio:
     def __init__(self, db_file='portfolio.db'):
@@ -16,45 +15,82 @@ class Portfolio:
             self.conn.execute('''
                 CREATE TABLE IF NOT EXISTS holdings (
                     ticker TEXT PRIMARY KEY,
-                    shares REAL
+                    shares REAL,
+                    purchase_price REAL
                 )
             ''')
 
-    def add_position(self, ticker, shares):
+    def add_position(self, ticker, shares, purchase_price):
         with self.conn:
-            self.conn.execute('''
-                INSERT INTO holdings (ticker, shares)
-                VALUES (?, ?)
-                ON CONFLICT(ticker) DO UPDATE SET shares = shares + excluded.shares
-            ''', (ticker, shares))
+            cursor = self.conn.cursor()
+            cursor.execute('SELECT shares FROM holdings WHERE ticker = ?', (ticker,))
+            row = cursor.fetchone()
+            if row:
+                current_shares = row[0]
+                cursor.execute('''
+                    UPDATE holdings SET shares = ?, purchase_price = ?
+                    WHERE ticker = ?
+                ''', (current_shares + shares, purchase_price, ticker))
+            else:
+                cursor.execute('''
+                    INSERT INTO holdings (ticker, shares, purchase_price)
+                    VALUES (?, ?, ?)
+                ''', (ticker, shares, purchase_price))
+            self.conn.commit()
 
     def remove_position(self, ticker, shares):
         with self.conn:
-            self.conn.execute('''
-                UPDATE holdings SET shares = shares - ?
-                WHERE ticker = ?
-            ''', (shares, ticker))
-            self.conn.execute('''
-                DELETE FROM holdings WHERE shares <= 0
-            ''')
+            cursor = self.conn.cursor()
+            cursor.execute('SELECT shares FROM holdings WHERE ticker = ?', (ticker,))
+            row = cursor.fetchone()
+            if row:
+                current_shares = row[0]
+                new_shares = current_shares - shares
+                if new_shares > 0:
+                    cursor.execute('''
+                        UPDATE holdings SET shares = ?
+                        WHERE ticker = ?
+                    ''', (new_shares, ticker))
+                else:
+                    cursor.execute('DELETE FROM holdings WHERE ticker = ?', (ticker,))
+                self.conn.commit()
 
     def get_current_value(self):
         total_value = 0
-        for ticker, shares in self.get_holdings().items():
+        holdings = self.get_holdings()
+        for ticker, details in holdings.items():
             stock = yf.Ticker(ticker)
-            current_price = stock.info['currentPrice']
-            total_value += current_price * shares
-        return total_value
+            try:
+                info = stock.info
+                if 'currentPrice' in info:
+                    current_price = info['currentPrice']
+                    total_value += current_price * details['shares']
+                else:
+                    print(f"Warning: Could not retrieve market price for {ticker}")
+            except Exception as e:
+                print(f"Error retrieving data for {ticker}: {e}")
+        return total_value, holdings
+
+    def get_holdings(self):
+        cursor = self.conn.execute('SELECT ticker, shares, purchase_price FROM holdings')
+        return {row[0]: {'shares': row[1], 'purchase_price': row[2]} for row in cursor}
 
     def plot_portfolio_composition(self):
         values = []
         labels = []
-        for ticker, shares in self.get_holdings().items():
+        for ticker, details in self.get_holdings().items():
             stock = yf.Ticker(ticker)
-            current_price = stock.info['currentPrice']
-            value = current_price * shares
-            values.append(value)
-            labels.append(ticker)
+            try:
+                info = stock.info
+                if 'currentPrice' in info:
+                    current_price = info['currentPrice']
+                    value = current_price * details['shares']
+                    values.append(value)
+                    labels.append(ticker)
+                else:
+                    print(f"Warning: Could not retrieve market price for {ticker}")
+            except Exception as e:
+                print(f"Error retrieving data for {ticker}: {e}")
 
         plt.pie(values, labels=labels, autopct='%1.1f%%')
         plt.title("Portfolio Composition")
@@ -62,52 +98,110 @@ class Portfolio:
         plt.savefig('portfolio_composition.png')
         plt.close()
 
-    def get_holdings(self):
-        cursor = self.conn.execute('SELECT ticker, shares FROM holdings')
-        return {row[0]: row[1] for row in cursor}
-
-    def save_portfolio(self, filename):
-        holdings = self.get_holdings()
-        with open(filename, 'w') as f:
-            json.dump(holdings, f)
-
-    def load_portfolio(self, filename):
-        with open(filename, 'r') as f:
-            holdings = json.load(f)
-        with self.conn:
-            self.conn.execute('DELETE FROM holdings')
-            for ticker, shares in holdings.items():
-                self.add_position(ticker, shares)
 
 def main():
-    parser = argparse.ArgumentParser(description="Portfolio Tracker CLI")
-    parser.add_argument('action', choices=['add', 'remove', 'value', 'plot', 'save', 'load'])
-    parser.add_argument('--ticker', help="Stock ticker symbol")
-    parser.add_argument('--shares', type=float, help="Number of shares")
-    parser.add_argument('--file', help="Filename for save/load")
-    parser.add_argument('--db', default='portfolio.db', help="Database file")
+    action_prompt = {
+        "type": "list",
+        "name": "action",
+        "message": "Choose an action:",
+        "choices": ["add", "remove", "value", "plot", "save", "load"]
+    }
 
-    args = parser.parse_args()
+    action_answer = prompt(action_prompt)['action']
 
-    portfolio = Portfolio(args.db)
+    portfolio = Portfolio()
 
-    if args.action == 'add':
-        portfolio.add_position(args.ticker, args.shares)
-        print(f"Added {args.shares} shares of {args.ticker}")
-    elif args.action == 'remove':
-        portfolio.remove_position(args.ticker, args.shares)
-        print(f"Removed {args.shares} shares of {args.ticker}")
-    elif args.action == 'value':
-        print(f"Current portfolio value: ${portfolio.get_current_value():.2f}")
-    elif args.action == 'plot':
+    if action_answer in ["add", "remove"]:
+        ticker_prompt = {
+            "type": "input",
+            "name": "ticker",
+            "message": "Enter stock ticker:",
+            "validate": EmptyInputValidator()
+        }
+        ticker_answer = prompt(ticker_prompt)['ticker']
+
+        stock = yf.Ticker(ticker_answer)
+        try:
+            info = stock.info
+            if info.get('currentPrice') is not None:
+                company_name = info.get('shortName')
+                current_price = info['currentPrice']
+                print(f"Company: {company_name}")
+                print(f"Current Price: ${current_price:.2f}")
+
+                confirm_prompt = {
+                    "type": "confirm",
+                    "name": "confirm",
+                    "message": "Do you want to proceed with this transaction?",
+                    "default": True
+                }
+                confirm_answer = prompt(confirm_prompt)['confirm']
+
+                if not confirm_answer:
+                    print("Transaction cancelled.")
+                    return
+
+                shares_prompt = {
+                    "type": "number",
+                    "name": "shares",
+                    "message": "Enter number of shares:",
+                    "validate": lambda result: float(result) > 0
+                }
+                shares_answer = prompt(shares_prompt)['shares']
+
+                if action_answer == "add":
+                    portfolio.add_position(ticker_answer, shares_answer, current_price)
+                    print(f"Added {shares_answer} shares of {ticker_answer} worth {(float (shares_answer)) * current_price:.2f}")
+                elif action_answer == "remove":
+                    portfolio.remove_position(ticker_answer, shares_answer)
+                    print(f"Removed {shares_answer} shares of {ticker_answer}")
+            else:
+                print(f"Invalid ticker or could not retrieve data for {ticker_answer}")
+        except Exception as e:
+            print(f"Error retrieving data for {ticker_answer}: {e}")
+
+    elif action_answer == "value":
+        total_value, holdings = portfolio.get_current_value()
+        print(f"Current portfolio value: ${total_value:.2f}")
+        print("Holdings breakdown:")
+        for ticker, details in holdings.items():
+            stock = yf.Ticker(ticker)
+            try:
+                info = stock.info
+                if 'currentPrice' in info:
+                    current_price = info['currentPrice']
+                    change = (current_price - details['purchase_price']) / details['purchase_price'] * 100
+                    print(f"{ticker}: {details['shares']} shares, Current Price: ${current_price:.2f}, Purchase Price: ${details['purchase_price']:.2f}, Change: {change:.2f}%")
+                else:
+                    print(f"Warning: Could not retrieve market price for {ticker}")
+            except Exception as e:
+                print(f"Error retrieving data for {ticker}: {e}")
+
+    elif action_answer == "plot":
         portfolio.plot_portfolio_composition()
         print("Portfolio composition plot saved as 'portfolio_composition.png'")
-    elif args.action == 'save':
-        portfolio.save_portfolio(args.file)
-        print(f"Portfolio saved to {args.file}")
-    elif args.action == 'load':
-        portfolio.load_portfolio(args.file)
-        print(f"Portfolio loaded from {args.file}")
+
+    elif action_answer == "save":
+        file_prompt = {
+            "type": "input",
+            "name": "file",
+            "message": "Enter filename to save the portfolio:",
+            "validate": EmptyInputValidator()
+        }
+        file_answer = prompt(file_prompt)['file']
+        portfolio.save_portfolio(file_answer)
+        print(f"Portfolio saved to {file_answer}")
+
+    elif action_answer == "load":
+        file_prompt = {
+            "type": "input",
+            "name": "file",
+            "message": "Enter filename to load the portfolio from:",
+            "validate": EmptyInputValidator()
+        }
+        file_answer = prompt(file_prompt)['file']
+        portfolio.load_portfolio(file_answer)
+        print(f"Portfolio loaded from {file_answer}")
 
 if __name__ == "__main__":
     main()
