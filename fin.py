@@ -21,6 +21,7 @@ class Portfolio:
             ''')
 
     def add_position(self, ticker, shares, purchase_price):
+        ticker = ticker.upper()
         with self.conn:
             cursor = self.conn.cursor()
             cursor.execute('SELECT shares FROM holdings WHERE ticker = ?', (ticker,))
@@ -39,6 +40,7 @@ class Portfolio:
             self.conn.commit()
 
     def remove_position(self, ticker, shares):
+        ticker = ticker.upper()
         with self.conn:
             cursor = self.conn.cursor()
             cursor.execute('SELECT shares FROM holdings WHERE ticker = ?', (ticker,))
@@ -57,6 +59,7 @@ class Portfolio:
 
     def get_current_value(self):
         total_value = 0
+        total_purchase_value = 0
         holdings = self.get_holdings()
         for ticker, details in holdings.items():
             stock = yf.Ticker(ticker)
@@ -65,11 +68,14 @@ class Portfolio:
                 if 'currentPrice' in info:
                     current_price = info['currentPrice']
                     total_value += current_price * details['shares']
+                    total_purchase_value += details['purchase_price'] * details['shares']
                 else:
                     print(f"Warning: Could not retrieve market price for {ticker}")
             except Exception as e:
                 print(f"Error retrieving data for {ticker}: {e}")
-        return total_value, holdings
+        total_change_value = total_value - total_purchase_value
+        total_change_percentage = (total_change_value / total_purchase_value) * 100 if total_purchase_value != 0 else 0
+        return total_value, total_change_value, total_change_percentage, holdings
 
     def get_holdings(self):
         cursor = self.conn.execute('SELECT ticker, shares, purchase_price FROM holdings')
@@ -98,13 +104,12 @@ class Portfolio:
         plt.savefig('portfolio_composition.png')
         plt.close()
 
-
 def main():
     action_prompt = {
         "type": "list",
         "name": "action",
         "message": "Choose an action:",
-        "choices": ["add", "remove", "value", "plot", "save", "load"]
+        "choices": ["add", "remove", "value", "plot"]
     }
 
     action_answer = prompt(action_prompt)['action']
@@ -118,7 +123,7 @@ def main():
             "message": "Enter stock ticker:",
             "validate": EmptyInputValidator()
         }
-        ticker_answer = prompt(ticker_prompt)['ticker']
+        ticker_answer = prompt(ticker_prompt)['ticker'].upper()
 
         stock = yf.Ticker(ticker_answer)
         try:
@@ -147,11 +152,11 @@ def main():
                     "message": "Enter number of shares:",
                     "validate": lambda result: float(result) > 0
                 }
-                shares_answer = prompt(shares_prompt)['shares']
+                shares_answer = float(prompt(shares_prompt)['shares'])
 
                 if action_answer == "add":
                     portfolio.add_position(ticker_answer, shares_answer, current_price)
-                    print(f"Added {shares_answer} shares of {ticker_answer} worth {(float (shares_answer)) * current_price:.2f}")
+                    print(f"Added {shares_answer} shares of {ticker_answer} worth ${shares_answer * current_price:.2f}")
                 elif action_answer == "remove":
                     portfolio.remove_position(ticker_answer, shares_answer)
                     print(f"Removed {shares_answer} shares of {ticker_answer}")
@@ -161,8 +166,10 @@ def main():
             print(f"Error retrieving data for {ticker_answer}: {e}")
 
     elif action_answer == "value":
-        total_value, holdings = portfolio.get_current_value()
+        total_value, total_change_value, total_change_percentage, holdings = portfolio.get_current_value()
         print(f"Current portfolio value: ${total_value:.2f}")
+        print(f"Total change in value: ${total_change_value:.2f}")
+        print(f"Total percentage change: {total_change_percentage:.2f}%")
         print("Holdings breakdown:")
         for ticker, details in holdings.items():
             stock = yf.Ticker(ticker)
@@ -180,28 +187,6 @@ def main():
     elif action_answer == "plot":
         portfolio.plot_portfolio_composition()
         print("Portfolio composition plot saved as 'portfolio_composition.png'")
-
-    elif action_answer == "save":
-        file_prompt = {
-            "type": "input",
-            "name": "file",
-            "message": "Enter filename to save the portfolio:",
-            "validate": EmptyInputValidator()
-        }
-        file_answer = prompt(file_prompt)['file']
-        portfolio.save_portfolio(file_answer)
-        print(f"Portfolio saved to {file_answer}")
-
-    elif action_answer == "load":
-        file_prompt = {
-            "type": "input",
-            "name": "file",
-            "message": "Enter filename to load the portfolio from:",
-            "validate": EmptyInputValidator()
-        }
-        file_answer = prompt(file_prompt)['file']
-        portfolio.load_portfolio(file_answer)
-        print(f"Portfolio loaded from {file_answer}")
 
 if __name__ == "__main__":
     main()
