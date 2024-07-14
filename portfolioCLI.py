@@ -8,6 +8,10 @@ from datetime import datetime
 from InquirerPy import inquirer
 from InquirerPy.validator import EmptyInputValidator
 from InquirerPy.base.control import Choice
+import requests
+import numpy as np
+import pandas as pd
+from scipy.optimize import minimize
 
 if not os.path.exists('logs'):
     os.makedirs('logs')
@@ -15,18 +19,18 @@ if not os.path.exists('logs'):
 log_file = f"logs/portfolio_{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}.log"
 
 logging.basicConfig(
-    level=logging.DEBUG,
+    level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     filename=log_file,
     filemode='w'
 )
 
 logger = logging.getLogger(__name__)
-console_handler = logging.StreamHandler()
-console_handler.setLevel(logging.INFO)
+# console_handler = logging.StreamHandler()
+# console_handler.setLevel(logging.INFO)
 formatter = logging.Formatter('%(levelname)s: %(message)s')
-console_handler.setFormatter(formatter)
-logger.addHandler(console_handler)
+# console_handler.setFormatter(formatter)
+# logger.addHandler(console_handler)
 
 
 class Portfolio:
@@ -92,7 +96,6 @@ class Portfolio:
         except sqlite3.Error as e:
             logger.error(f"Error creating tables: {e}")
             raise
-
 
     def add_holding(self, ticker, shares):
         ticker = ticker.upper()
@@ -384,31 +387,123 @@ class Portfolio:
         except Exception as e:
             logger.error(f"Error retrieving news for {ticker}: {e}")
             return []
-    def calculate_total_return(self):
-        try:
-            holdings = self.get_holdings()
-            total_cost = 0
-            total_current_value = 0
-            for ticker, details in holdings.items():
-                stock = yf.Ticker(ticker)
-                info = stock.info
-                if 'currentPrice' in info:
-                    current_price = info['currentPrice']
-                    shares = details['shares']
-                    purchase_price = details['purchase_price']
-                    total_cost += shares * purchase_price
-                    total_current_value += shares * current_price
-            if total_cost > 0:
-                total_return = ((total_current_value - total_cost) / total_cost) * 100
-                logger.info(f"Calculated total return: {total_return:.2f}%")
-                return total_return
-            else:
-                logger.warning("No holdings found or total cost is zero")
-                return 0
-        except Exception as e:
-            logger.error(f"Error calculating total return: {e}")
-            return 0
 
+    def calculate_total_return(self):
+            try:
+                holdings = self.get_holdings()
+                total_cost = 0
+                total_current_value = 0
+                for ticker, details in holdings.items():
+                    stock = yf.Ticker(ticker)
+                    info = stock.info
+                    if 'currentPrice' in info:
+                        current_price = info['currentPrice']
+                        shares = details['shares']
+                        purchase_price = details['purchase_price']
+                        total_cost += shares * purchase_price
+                        total_current_value += shares * current_price
+                if total_cost > 0:
+                    total_return = ((total_current_value - total_cost) / total_cost) * 100
+                    logger.info(f"Calculated total return: {total_return:.2f}%")
+                    return total_return
+                else:
+                    logger.warning("No holdings found or total cost is zero")
+                    return 0
+            except Exception as e:
+                logger.error(f"Error calculating total return: {e}")
+                return 0
+
+    def convert_currency(self, target_currency):
+        api_key = "API_KEY"
+        base_url = f"https://api.exchangerate-api.com/v4/latest/USD"
+
+        try:
+            response = requests.get(base_url)
+            data = response.json()
+            
+            if target_currency not in data['rates']:
+                print(f"Error: {target_currency} is not a valid currency code.")
+                return
+
+            exchange_rate = data['rates'][target_currency]
+            total_value, _, _, _ = self.get_current_value()
+            converted_value = total_value * exchange_rate
+
+            print(f"Portfolio value in {target_currency}: {converted_value:.2f}")
+        except requests.RequestException as e:
+            print(f"Error fetching exchange rates: {e}")
+
+    def screen_stocks(self, criteria):
+        results = []
+        
+        stock_list = ['AAPL', 'GOOGL', 'MSFT', 'AMZN', 'FB', 'TSLA', 'JPM', 'JNJ', 'V', 'PG']
+        
+        for ticker in stock_list:
+            stock = yf.Ticker(ticker)
+            info = stock.info
+            
+            meets_criteria = True
+            for key, (min_val, max_val) in criteria.items():
+                value = info.get(key, None)
+                if value is None:
+                    meets_criteria = False
+                    break
+                if min_val is not None and value < min_val:
+                    meets_criteria = False
+                    break
+                if max_val is not None and value > max_val:
+                    meets_criteria = False
+                    break
+            
+            if meets_criteria:
+                results.append({
+                    'Ticker': ticker,
+                    'Name': info.get('longName', 'N/A'),
+                    'Price': info.get('currentPrice', 'N/A'),
+                    'P/E': info.get('trailingPE', 'N/A'),
+                    'Dividend Yield': info.get('dividendYield', 'N/A'),
+                    'Market Cap': info.get('marketCap', 'N/A')
+                })
+        
+        return results
+
+    def optimize_portfolio(self):
+        holdings = self.get_holdings()
+        tickers = list(holdings.keys())
+        
+        data = yf.download(tickers, start="2020-01-01", end=datetime.now().strftime("%Y-%m-%d"))['Adj Close']
+
+        returns = data.pct_change()
+
+        mean_returns = returns.mean()
+        cov_matrix = returns.cov()
+        
+        def portfolio_performance(weights, mean_returns, cov_matrix):
+            portfolio_return = np.sum(mean_returns * weights) * 252
+            portfolio_std_dev = np.sqrt(np.dot(weights.T, np.dot(cov_matrix, weights))) * np.sqrt(252)
+            return portfolio_std_dev, portfolio_return
+        
+        constraints = ({'type': 'eq', 'fun': lambda x: np.sum(x) - 1})
+        
+        bounds = tuple((0, 1) for _ in range(len(tickers)))
+        
+        init_guess = [1/len(tickers)] * len(tickers)
+        
+        def neg_sharpe_ratio(weights, mean_returns, cov_matrix, risk_free_rate=0.01):
+            p_std_dev, p_ret = portfolio_performance(weights, mean_returns, cov_matrix)
+            return -(p_ret - risk_free_rate) / p_std_dev
+        
+        result = minimize(neg_sharpe_ratio, init_guess, args=(mean_returns, cov_matrix),
+                            method='SLSQP', bounds=bounds, constraints=constraints)
+        
+        print("Optimized Portfolio Allocation:")
+        for ticker, weight in zip(tickers, result.x):
+            print(f"{ticker}: {weight:.2%}")
+        
+        std_dev, ret = portfolio_performance(result.x, mean_returns, cov_matrix)
+        print(f"Expected annual return: {ret:.2%}")
+        print(f"Annual volatility: {std_dev:.2%}")
+        print(f"Sharpe Ratio: {(ret - 0.01) / std_dev:.2f}")
 
 
 def main():
@@ -436,6 +531,9 @@ def main():
                 Choice("view_dividends", name="View dividends"),
                 Choice("get_news", name="Get stock news"),
                 Choice("total_return", name="Calculate total return"),
+                Choice("convert_currency", name="Convert portfolio value to another currency"),
+                Choice("screen_stocks", name="Screen stocks based on criteria"),
+                Choice("optimize_portfolio", name="Optimize portfolio allocation"),
                 Choice("exit", name="Exit")
             ]
         ).execute()
@@ -516,6 +614,34 @@ def main():
             elif action == "total_return":
                 total_return = portfolio.calculate_total_return()
                 print(f"Total portfolio return: {total_return:.2f}%")
+
+            elif action == "convert_currency":
+                target_currency = inquirer.text(
+                    message="Enter target currency code (e.g., EUR, GBP):",
+                    validate=EmptyInputValidator()
+                ).execute()
+                portfolio.convert_currency(target_currency)
+
+            elif action == "screen_stocks":
+                print("Enter screening criteria:")
+                pe_max = inquirer.float(message="Maximum P/E ratio:").execute()
+                div_yield_min = inquirer.float(message="Minimum Dividend Yield (as decimal):").execute()
+                market_cap_min = inquirer.float(message="Minimum Market Cap (in billions):").execute()
+                
+                criteria = {
+                    'trailingPE': (0, pe_max),
+                    'dividendYield': (div_yield_min, None),
+                    'marketCap': (market_cap_min * 1e9, None)
+                }
+                
+                results = portfolio.screen_stocks(criteria)
+                for stock in results:
+                    print(f"{stock['Ticker']} - {stock['Name']}")
+                    print(f"  Price: ${stock['Price']:.2f}, P/E: {stock['P/E']:.2f}, Dividend Yield: {stock['Dividend Yield']:.2%}, Market Cap: ${stock['Market Cap']:,.0f}")
+                print(f"Found {len(results)} stocks matching criteria.")
+
+            elif action == "optimize_portfolio":
+                portfolio.optimize_portfolio()
 
             elif action == "exit":
                 print("Exiting the program.")
