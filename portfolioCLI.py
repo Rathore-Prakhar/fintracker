@@ -2,32 +2,53 @@ import sqlite3
 import yfinance as yf
 import datetime
 import matplotlib.pyplot as plt
-from PyInquirer import prompt, Validator, ValidationError
+import logging
+import os
+from datetime import datetime
+from InquirerPy import inquirer
+from InquirerPy.validator import EmptyInputValidator
+from InquirerPy.base.control import Choice
 
+if not os.path.exists('logs'):
+    os.makedirs('logs')
 
-class EmptyInputValidator(Validator):
-    def validate(self, document):
-        if not document.text.strip():
-            raise ValidationError(
-                message='Input cannot be empty',
-                cursor_position=len(document.text)
-            )
+log_file = f"logs/portfolio_{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}.log"
+
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    filename=log_file,
+    filemode='w'
+)
+
+logger = logging.getLogger(__name__)
+console_handler = logging.StreamHandler()
+console_handler.setLevel(logging.INFO)
+formatter = logging.Formatter('%(levelname)s: %(message)s')
+console_handler.setFormatter(formatter)
+logger.addHandler(console_handler)
 
 
 class Portfolio:
     def __init__(self, db_filename='portfolio.db'):
-        self.conn = sqlite3.connect(db_filename)
-        self.create_table()
+        try:
+            self.conn = sqlite3.connect(db_filename)
+            self.create_table()
+            logger.info(f"Connected to database: {db_filename}")
+        except sqlite3.Error as e:
+            logger.error(f"Error connecting to database: {e}")
+            raise
 
     def create_table(self):
-        with self.conn:
-            self.conn.execute('''
-                CREATE TABLE IF NOT EXISTS holdings (
-                    ticker TEXT PRIMARY KEY,
-                    shares REAL,
-                    purchase_price REAL
-                )
-            ''')
+        try:
+            with self.conn:
+                self.conn.execute('''
+                    CREATE TABLE IF NOT EXISTS holdings (
+                        ticker TEXT PRIMARY KEY,
+                        shares REAL,
+                        purchase_price REAL
+                    )
+                ''')
             self.conn.execute('''
                 CREATE TABLE IF NOT EXISTS transactions (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -67,19 +88,37 @@ class Portfolio:
                     date TEXT
                 )
             ''')
+            logger.info("Tables created successfully")
+        except sqlite3.Error as e:
+            logger.error(f"Error creating tables: {e}")
+            raise
 
-    def add_holding(self, ticker, shares, purchase_price):
+
+    def add_holding(self, ticker, shares):
         ticker = ticker.upper()
-        with self.conn:
-            self.conn.execute('''
-                INSERT OR REPLACE INTO holdings (ticker, shares, purchase_price)
-                VALUES (?, COALESCE((SELECT shares FROM holdings WHERE ticker = ?) + ?, ?), ?)
-            ''', (ticker, ticker, shares, shares, purchase_price))
-            self.conn.execute('''
-                INSERT INTO transactions (ticker, shares, purchase_price, date)
-                VALUES (?, ?, ?, ?)
-            ''', (ticker, shares, purchase_price, datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
-            self.conn.commit()
+        try:
+            stock = yf.Ticker(ticker)
+            info = stock.info
+            if 'currentPrice' in info:
+                current_price = info['currentPrice']
+                with self.conn:
+                    self.conn.execute('''
+                        INSERT OR REPLACE INTO holdings (ticker, shares, purchase_price)
+                        VALUES (?, COALESCE((SELECT shares FROM holdings WHERE ticker = ?) + ?, ?), ?)
+                    ''', (ticker, ticker, shares, shares, current_price))
+                    self.conn.execute('''
+                        INSERT INTO transactions (ticker, shares, purchase_price, date)
+                        VALUES (?, ?, ?, ?)
+                    ''', (ticker, shares, current_price, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+                    self.conn.commit()
+                logger.info(f"Added {shares} shares of {ticker} at ${current_price}")
+                print(f"Added {shares} shares of {ticker} at current market price ${current_price}")
+            else:
+                logger.error(f"Error retrieving current price for {ticker}")
+                print(f"Error: Could not retrieve current price for {ticker}")
+        except Exception as e:
+            logger.error(f"Error adding holding: {e}")
+            print(f"Error adding holding: {e}")
 
     def remove_holding(self, ticker, shares):
         ticker = ticker.upper()
@@ -103,7 +142,7 @@ class Portfolio:
                     self.conn.execute('''
                         INSERT INTO transactions (ticker, shares, purchase_price, date)
                         VALUES (?, ?, ?, ?)
-                    ''', (ticker, -shares, 0, datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+                    ''', (ticker, -shares, 0, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
                     self.conn.commit()
             else:
                 print(f"Error: No holdings found for {ticker}.")
@@ -155,7 +194,7 @@ class Portfolio:
         cursor = self.conn.execute('SELECT ticker, shares, purchase_price, date FROM transactions ORDER BY date')
         data = cursor.fetchall()
         if data:
-            dates, prices = zip(*[(datetime.datetime.strptime(row[3], "%Y-%m-%d %H:%M:%S"), row[2]) for row in data])
+            dates, prices = zip(*[(datetime.strptime(row[3], "%Y-%m-%d %H:%M:%S"), row[2]) for row in data])
             plt.plot(dates, prices)
             plt.xlabel('Date')
             plt.ylabel('Price')
@@ -271,7 +310,7 @@ class Portfolio:
             self.conn.execute('''
                 INSERT INTO performance (date, value)
                 VALUES (?, ?)
-            ''', (datetime.datetime.now().strftime("%Y-%m-%d"), total_value))
+            ''', (datetime.now().strftime("%Y-%m-%d"), total_value))
             self.conn.commit()
 
     def plot_performance(self):
@@ -318,7 +357,7 @@ class Portfolio:
             self.conn.execute('''
                 INSERT INTO dividends (ticker, amount, date)
                 VALUES (?, ?, ?)
-            ''', (ticker, amount, datetime.datetime.now().strftime("%Y-%m-%d")))
+            ''', (ticker, amount, datetime.now().strftime("%Y-%m-%d")))
             self.conn.commit()
 
     def view_dividends(self):
@@ -328,187 +367,163 @@ class Portfolio:
         for dividend in dividends:
             print(dividend)
 
+    def get_stock_news(self, ticker):
+        ticker = ticker.upper()
+        try:
+            stock = yf.Ticker(ticker)
+            news = stock.news
+            with self.conn:
+                for item in news[:5]:
+                    self.conn.execute('''
+                        INSERT INTO news (ticker, headline, date)
+                        VALUES (?, ?, ?)
+                    ''', (ticker, item['title'], datetime.fromtimestamp(item['providerPublishTime']).strftime("%Y-%m-%d %H:%M:%S")))
+                self.conn.commit()
+            logger.info(f"Retrieved and stored news for {ticker}")
+            return news
+        except Exception as e:
+            logger.error(f"Error retrieving news for {ticker}: {e}")
+            return []
+    def calculate_total_return(self):
+        try:
+            holdings = self.get_holdings()
+            total_cost = 0
+            total_current_value = 0
+            for ticker, details in holdings.items():
+                stock = yf.Ticker(ticker)
+                info = stock.info
+                if 'currentPrice' in info:
+                    current_price = info['currentPrice']
+                    shares = details['shares']
+                    purchase_price = details['purchase_price']
+                    total_cost += shares * purchase_price
+                    total_current_value += shares * current_price
+            if total_cost > 0:
+                total_return = ((total_current_value - total_cost) / total_cost) * 100
+                logger.info(f"Calculated total return: {total_return:.2f}%")
+                return total_return
+            else:
+                logger.warning("No holdings found or total cost is zero")
+                return 0
+        except Exception as e:
+            logger.error(f"Error calculating total return: {e}")
+            return 0
+
+
 
 def main():
-    action_prompt = {
-        "type": "list",
-        "name": "action",
-        "message": "Choose an action:",
-        "choices": ["add", "remove", "value", "plot", "history", "export", "import", "compare", "set alert", "set percentage alert", "check alerts", "track performance", "plot performance", "plot sector distribution", "add dividend", "view dividends"]
-    }
-
-    action_answer = prompt(action_prompt)['action']
-
     portfolio = Portfolio()
 
-    if action_answer == "add":
-        ticker_prompt = {
-            "type": "input",
-            "name": "ticker",
-            "message": "Enter stock ticker:",
-            "validate": EmptyInputValidator()
-        }
-        ticker_answer = prompt(ticker_prompt)['ticker'].upper()
+    while True:
+        action = inquirer.select(
+            message="Choose an action:",
+            choices=[
+                Choice("add", name="Add holding"),
+                Choice("remove", name="Remove holding"),
+                Choice("value", name="Get portfolio value"),
+                Choice("plot", name="Plot portfolio"),
+                Choice("history", name="Plot transaction history"),
+                Choice("export", name="Export to CSV"),
+                Choice("import", name="Import from CSV"),
+                Choice("compare", name="Compare with benchmark"),
+                Choice("set_alert", name="Set price alert"),
+                Choice("set_percentage_alert", name="Set percentage alert"),
+                Choice("check_alerts", name="Check alerts"),
+                Choice("track_performance", name="Track performance"),
+                Choice("plot_performance", name="Plot performance"),
+                Choice("plot_sector", name="Plot sector distribution"),
+                Choice("add_dividend", name="Add dividend"),
+                Choice("view_dividends", name="View dividends"),
+                Choice("get_news", name="Get stock news"),
+                Choice("total_return", name="Calculate total return"),
+                Choice("exit", name="Exit")
+            ]
+        ).execute()
 
-        shares_prompt = {
-            "type": "number",
-            "name": "shares",
-            "message": "Enter number of shares:",
-        }
-        shares_answer = float(prompt(shares_prompt)['shares'])
+        try:
+            if action == "add":
+                ticker = inquirer.text(message="Enter stock ticker:", validate=EmptyInputValidator()).execute()
+                shares = inquirer.number(message="Enter number of shares:").execute()
+                portfolio.add_holding(ticker, shares)
 
-        price_prompt = {
-            "type": "number",
-            "name": "price",
-            "message": "Enter purchase price:",
-        }
-        price_answer = float(prompt(price_prompt)['price'])
+            elif action == "remove":
+                ticker = inquirer.text(message="Enter stock ticker:", validate=EmptyInputValidator()).execute()
+                shares = inquirer.number(message="Enter number of shares to remove:").execute()
+                portfolio.remove_holding(ticker, shares)
 
-        portfolio.add_holding(ticker_answer, shares_answer, price_answer)
-        print(f"Added {shares_answer} shares of {ticker_answer} at ${price_answer} each.")
+            elif action == "value":
+                total_value, holdings, num_stocks, stock_list = portfolio.get_current_value()
+                print(f"Total portfolio value: ${total_value:.2f}")
+                print(f"Number of different stocks: {num_stocks}")
+                print("Stock list:", stock_list)
 
-    elif action_answer == "remove":
-        ticker_prompt = {
-            "type": "input",
-            "name": "ticker",
-            "message": "Enter stock ticker:",
-            "validate": EmptyInputValidator()
-        }
-        ticker_answer = prompt(ticker_prompt)['ticker'].upper()
+            elif action == "plot":
+                portfolio.plot_portfolio()
 
-        shares_prompt = {
-            "type": "number",
-            "name": "shares",
-            "message": "Enter number of shares to remove:",
-        }
-        shares_answer = float(prompt(shares_prompt)['shares'])
+            elif action == "history":
+                portfolio.plot_history()
 
-        portfolio.remove_holding(ticker_answer, shares_answer)
-        print(f"Removed {shares_answer} shares of {ticker_answer}.")
+            elif action == "export":
+                filename = inquirer.text(message="Enter filename for export (e.g., portfolio.csv):", validate=EmptyInputValidator()).execute()
+                portfolio.export_to_csv(filename)
 
-    elif action_answer == "value":
-        total_value, holdings, num_stocks, stock_list = portfolio.get_current_value()
-        print(f"Total portfolio value: ${total_value:.2f}")
-        print(f"Number of different stocks: {num_stocks}")
-        print("Stock list:", stock_list)
+            elif action == "import":
+                filename = inquirer.text(message="Enter filename for import (e.g., portfolio.csv):", validate=EmptyInputValidator()).execute()
+                portfolio.import_from_csv(filename)
 
-    elif action_answer == "plot":
-        portfolio.plot_portfolio()
+            elif action == "compare":
+                benchmark = inquirer.text(message="Enter benchmark ticker (e.g., ^GSPC):", validate=EmptyInputValidator()).execute()
+                portfolio.compare_with_benchmark(benchmark)
 
-    elif action_answer == "history":
-        portfolio.plot_history()
+            elif action == "set_alert":
+                ticker = inquirer.text(message="Enter stock ticker:", validate=EmptyInputValidator()).execute()
+                threshold = inquirer.number(message="Enter price threshold:").execute()
+                direction = inquirer.select(message="Alert when price goes:", choices=["above", "below"]).execute()
+                portfolio.set_price_alert(ticker, threshold, direction)
 
-    elif action_answer == "export":
-        filename_prompt = {
-            "type": "input",
-            "name": "filename",
-            "message": "Enter filename for export (e.g., portfolio.csv):",
-            "validate": EmptyInputValidator()
-        }
-        filename_answer = prompt(filename_prompt)['filename']
-        portfolio.export_to_csv(filename_answer)
+            elif action == "set_percentage_alert":
+                ticker = inquirer.text(message="Enter stock ticker:", validate=EmptyInputValidator()).execute()
+                percentage = inquirer.number(message="Enter percentage change threshold:").execute()
+                portfolio.set_percentage_alert(ticker, percentage)
 
-    elif action_answer == "import":
-        filename_prompt = {
-            "type": "input",
-            "name": "filename",
-            "message": "Enter filename for import (e.g., portfolio.csv):",
-            "validate": EmptyInputValidator()
-        }
-        filename_answer = prompt(filename_prompt)['filename']
-        portfolio.import_from_csv(filename_answer)
+            elif action == "check_alerts":
+                portfolio.check_alerts()
 
-    elif action_answer == "compare":
-        benchmark_prompt = {
-            "type": "input",
-            "name": "benchmark",
-            "message": "Enter benchmark ticker (e.g., ^GSPC):",
-            "validate": EmptyInputValidator()
-        }
-        benchmark_answer = prompt(benchmark_prompt)['benchmark']
-        portfolio.compare_with_benchmark(benchmark_answer)
+            elif action == "track_performance":
+                portfolio.track_performance()
+                print("Tracked current portfolio performance.")
 
-    elif action_answer == "set alert":
-        ticker_prompt = {
-            "type": "input",
-            "name": "ticker",
-            "message": "Enter stock ticker:",
-            "validate": EmptyInputValidator()
-        }
-        ticker_answer = prompt(ticker_prompt)['ticker'].upper()
+            elif action == "plot_performance":
+                portfolio.plot_performance()
 
-        threshold_prompt = {
-            "type": "number",
-            "name": "threshold",
-            "message": "Enter price threshold:",
-        }
-        threshold_answer = float(prompt(threshold_prompt)['threshold'])
+            elif action == "plot_sector":
+                portfolio.plot_sector_distribution()
 
-        direction_prompt = {
-            "type": "list",
-            "name": "direction",
-            "message": "Alert when price goes:",
-            "choices": ["above", "below"]
-        }
-        direction_answer = prompt(direction_prompt)['direction']
+            elif action == "add_dividend":
+                ticker = inquirer.text(message="Enter stock ticker:", validate=EmptyInputValidator()).execute()
+                amount = inquirer.number(message="Enter dividend amount:").execute()
+                portfolio.add_dividend(ticker, amount)
 
-        portfolio.set_price_alert(ticker_answer, threshold_answer, direction_answer)
-        print(f"Alert set for {ticker_answer} when price is {direction_answer} ${threshold_answer}.")
+            elif action == "view_dividends":
+                portfolio.view_dividends()
 
-    elif action_answer == "set percentage alert":
-        ticker_prompt = {
-            "type": "input",
-            "name": "ticker",
-            "message": "Enter stock ticker:",
-            "validate": EmptyInputValidator()
-        }
-        ticker_answer = prompt(ticker_prompt)['ticker'].upper()
+            elif action == "get_news":
+                ticker = inquirer.text(message="Enter stock ticker:", validate=EmptyInputValidator()).execute()
+                news = portfolio.get_stock_news(ticker)
+                for item in news[:5]:
+                    print(f"{item['title']} - {datetime.fromtimestamp(item['providerPublishTime']).strftime('%Y-%m-%d %H:%M:%S')}")
 
-        percentage_prompt = {
-            "type": "number",
-            "name": "percentage",
-            "message": "Enter percentage change threshold:",
-        }
-        percentage_answer = float(prompt(percentage_prompt)['percentage'])
+            elif action == "total_return":
+                total_return = portfolio.calculate_total_return()
+                print(f"Total portfolio return: {total_return:.2f}%")
 
-        portfolio.set_percentage_alert(ticker_answer, percentage_answer)
-        print(f"Percentage alert set for {ticker_answer} at {percentage_answer}% change.")
+            elif action == "exit":
+                print("Exiting the program.")
+                break
 
-    elif action_answer == "check alerts":
-        portfolio.check_alerts()
-
-    elif action_answer == "track performance":
-        portfolio.track_performance()
-        print("Tracked current portfolio performance.")
-
-    elif action_answer == "plot performance":
-        portfolio.plot_performance()
-
-    elif action_answer == "plot sector distribution":
-        portfolio.plot_sector_distribution()
-
-    elif action_answer == "add dividend":
-        ticker_prompt = {
-            "type": "input",
-            "name": "ticker",
-            "message": "Enter stock ticker:",
-            "validate": EmptyInputValidator()
-        }
-        ticker_answer = prompt(ticker_prompt)['ticker'].upper()
-
-        amount_prompt = {
-            "type": "number",
-            "name": "amount",
-            "message": "Enter dividend amount:",
-        }
-        amount_answer = float(prompt(amount_prompt)['amount'])
-
-        portfolio.add_dividend(ticker_answer, amount_answer)
-        print(f"Dividend of ${amount_answer} for {ticker_answer} added.")
-
-    elif action_answer == "view dividends":
-        portfolio.view_dividends()
-
+        except Exception as e:
+            logger.error(f"An error occurred: {e}")
+            print(f"An error occurred: {e}")
 
 if __name__ == "__main__":
     main()
